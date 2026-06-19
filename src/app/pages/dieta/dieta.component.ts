@@ -1,9 +1,9 @@
 import { Component, CUSTOM_ELEMENTS_SCHEMA, OnInit, signal, inject, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
-import { switchMap, catchError, of } from 'rxjs';
+import { switchMap, catchError, of, forkJoin } from 'rxjs';
 import { AuthStore } from '../../core/store/auth.store';
-import { NutricionService, NutricionDieta, NutricionMenu, NutricionMenuDetalle, ResumenDiario } from '../../core/services/nutricion.service';
+import { NutricionService, NutricionDieta, NutricionMenu, NutricionMenuDetalle, ResumenDiario, NutricionRegistroComida, CrearRegistroComidaPayload } from '../../core/services/nutricion.service';
 import { MacroRowComponent } from '../../shared/components/macro-row/macro-row.component';
 
 const SHORT_DAYS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
@@ -142,6 +142,14 @@ function diaLabel(fechaInicio: string, diaNumero: number): string {
             @if (detalle.instrucciones) {
               <p class="instrucciones">{{ detalle.instrucciones }}</p>
             }
+
+            @if (!isConsumed(detalle) && selectedDay() === todayDia()) {
+              <button class="mark-btn" [disabled]="registering() === detalle.id" (click)="registrarConsumo(detalle)">
+                @if (registering() === detalle.id) { <div class="spinner-sm"></div> }
+                @else { <ion-icon name="checkmark-outline" style="font-size:16px;color:#fff"></ion-icon> }
+                Marcar consumida
+              </button>
+            }
           </div>
         }
       }
@@ -204,6 +212,10 @@ function diaLabel(fechaInicio: string, diaNumero: number): string {
     .alimento-gram { font-size: 12px; color: #136967; font-weight: 700; }
 
     .instrucciones { padding: 0 14px 14px; font-size: 13px; color: #136967; line-height: 1.5; margin: 0; font-style: italic; }
+
+    .mark-btn { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 11px 14px; border-radius: 10px; background: #2f6648; border: none; color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; font-family: inherit; margin: 0 14px 14px; }
+    .mark-btn:disabled { opacity: 0.6; cursor: default; }
+    .spinner-sm { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.4); border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite; }
   `],
 })
 export class DietaComponent implements OnInit {
@@ -217,7 +229,9 @@ export class DietaComponent implements OnInit {
   detallesAll = signal<NutricionMenuDetalle[]>([]);
   resumen     = signal<ResumenDiario | null>(null);
   selectedDay = signal(1);
-  todayDiaNum = signal(1);
+  todayDiaNum  = signal(1);
+  registering  = signal<number | null>(null);
+  registrosHoy = signal<NutricionRegistroComida[]>([]);
 
   diasPresentes = computed(() => {
     return Array.from(new Set(this.detallesAll().map(d => d.dia_numero))).sort((a, b) => a - b);
@@ -234,6 +248,9 @@ export class DietaComponent implements OnInit {
     for (const r of this.resumen()?.registros_comida ?? []) {
       if (r.menu_detalle_id && r.estado === 'C') map[r.menu_detalle_id] = true;
     }
+    for (const r of this.registrosHoy()) {
+      if (r.menu_detalle_id) map[r.menu_detalle_id] = true;
+    }
     return map;
   });
 
@@ -247,15 +264,43 @@ export class DietaComponent implements OnInit {
   todayDia()            { return this.todayDiaNum(); }
   diaLabel(fi: string, n: number) { return diaLabel(fi, n); }
 
+  private readonly MEAL_NAMES_MAP: Record<number, string> = { 1:'Desayuno', 2:'Media Mañana', 3:'Almuerzo', 4:'Media Tarde', 5:'Merienda / Cena' };
+
+  registrarConsumo(detalle: NutricionMenuDetalle): void {
+    if (this.registering()) return;
+    this.registering.set(detalle.id);
+    const pid = this.auth.pacienteId()!;
+    const today = new Date().toISOString().split('T')[0];
+    const payload: CrearRegistroComidaPayload = {
+      fecha: today,
+      tipo_comida_id: detalle.tipo_comida_id,
+      menu_detalle_id: detalle.id,
+      fuera_de_plan: false,
+      calorias_consumidas: detalle.calorias_total ?? undefined,
+      descripcion_libre: detalle.nombre_comida ?? this.MEAL_NAMES_MAP[detalle.tipo_comida_id] ?? 'Comida',
+      proteinas_g: detalle.proteinas_g_total ?? undefined,
+      carbohidratos_g: detalle.carbohidratos_g_total ?? undefined,
+      grasas_g: detalle.grasas_g_total ?? undefined,
+    };
+    this.svc.crearRegistroComida(pid, payload).pipe(catchError(() => of(null))).subscribe(reg => {
+      if (reg) this.registrosHoy.update(list => [...list, reg]);
+      this.registering.set(null);
+    });
+  }
+
   ngOnInit(): void {
     const pid = this.auth.pacienteId();
     if (!pid) { this.loading.set(false); return; }
 
     const today = new Date().toISOString().split('T')[0];
 
-    // Load resumen diario in parallel
-    this.svc.getResumenDiario(pid, today).pipe(catchError(() => of(null)))
-      .subscribe(r => { if (r) this.resumen.set(r); });
+    forkJoin({
+      resumen:   this.svc.getResumenDiario(pid, today).pipe(catchError(() => of(null))),
+      registros: this.svc.getRegistrosComida(pid, today).pipe(catchError(() => of(null))),
+    }).subscribe(({ resumen, registros }) => {
+      if (resumen) this.resumen.set(resumen);
+      if (registros) this.registrosHoy.set(registros.data ?? []);
+    });
 
     // Chain: dietas → menus → menu detalles
     this.svc.getDietas(pid).pipe(
